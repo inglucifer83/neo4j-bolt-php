@@ -32,6 +32,11 @@ class Driver implements DriverInterface
     protected $io;
 
     /**
+     * @var StreamSocket
+     */
+    protected $leaderIO;
+
+    /**
      * @var EventDispatcher
      */
     protected $dispatcher;
@@ -42,9 +47,19 @@ class Driver implements DriverInterface
     protected $sessionRegistry;
 
     /**
+     * @var SessionRegistry
+     */
+    protected $leaderSessionRegistry;
+
+    /**
      * @var bool
      */
     protected $versionAgreed = false;
+
+    /**
+     * @var bool
+     */
+    protected $leaderVersionAgreed = false;
 
     /**
      * @var Session
@@ -52,9 +67,29 @@ class Driver implements DriverInterface
     protected $session;
 
     /**
+     * @var Session
+     */
+    protected $leaderSession;
+
+    /**
      * @var array
      */
     protected $credentials;
+
+    /**
+     * @var bool Determines whether it is a causal cluster that we're dealing with
+     */
+    protected $isCausalCluster;
+
+    /**
+     * @var array Servers we can execute write queries on.
+     */
+    private $writeServers = [];
+
+    /**
+     * @var array Servers we can execute read queries on.
+     */
+    private $readServers = [];
 
     /**
      * @return string
@@ -100,6 +135,62 @@ class Driver implements DriverInterface
         $this->io = StreamSocket::withConfiguration($host, $port, $config, $this->dispatcher);
         $this->sessionRegistry = new SessionRegistry($this->io, $this->dispatcher);
         $this->sessionRegistry->registerSession(Session::class);
+
+        // get role to see whether we should get a writer session
+        // or this one is already connected to a leader
+
+        // 1. determine whether it is a causal cluster
+        if ($this->isCausalCluster()) {
+            // 2. create a writer session, now that we have writer and reader servers
+            // 2.1. choose a writer server (supposedly the leader, could always be only one [unsure])
+            $writeServer = $this->writeServers[array_rand($this->writeServers)];
+
+            // 2.2. initiate an io writer and feed it to a new chunk writer to send request
+            $parsedWriteUri = parse_url($writeServer);
+            $leaderHost = isset($parsedWriteUri['host']) ? $parsedWriteUri['host'] : $parsedWriteUri['path'];
+            $leaderPort = isset($parsedWriteUri['port']) ? $parsedWriteUri['port'] : static::DEFAULT_TCP_PORT;
+            $this->leaderIO = StreamSocket::withConfiguration($leaderHost, $leaderPort, $config, $this->dispatcher);
+            $this->leaderSessionRegistry = new SessionRegistry($this->leaderIO, $this->dispatcher);
+            $this->leaderSessionRegistry->registerSession(Session::class);
+        }
+    }
+
+    /**
+     * Determines whether this is a causal cluster
+     * that we are connected to.
+     *
+     * @return bool
+     */
+    public function isCausalCluster()
+    {
+        // at first, assume it is not a cluster until proven to be so.
+        if (!isset($this->isCausalCluster)) {
+            $this->isCausalCluster = false;
+            // do we have the cluster procedure? (available in enterprise and only in clusters)
+            $proceduresResult = $this->session()->run('CALL dbms.procedures() YIELD name WHERE name="dbms.cluster.routing.getServers" RETURN name');
+
+            if (count($proceduresResult->getRecords()) > 0) {
+                $result = $this->session()->run('CALL dbms.cluster.routing.getServers()');
+
+                // determine whether we're using clustering
+                if (count($result->getRecords()) > 0 && $result->getRecord()->hasValue('servers')) {
+                    $this->isCausalCluster = true;
+                    // distribute servers
+                    foreach ($result->getRecord()->value('servers') as $server) {
+                        switch ($server['role']) {
+                            case 'WRITE':
+                                $this->writeServers = $server['addresses'];
+                                break;
+                            case 'READ':
+                                $this->readServers = $server['addresses'];
+                                break;
+                        }
+                    }
+                }
+            }
+        }
+
+        return $this->isCausalCluster;
     }
 
     /**
@@ -120,17 +211,38 @@ class Driver implements DriverInterface
         return $this->session;
     }
 
+    public function writeSession() {
+        if (!$this->isCausalCluster) {
+            return $this->session();
+        }
+
+        if (null !== $this->leaderSession) {
+            return $this->leaderSession;
+        }
+
+        if (!$this->leaderVersionAgreed) {
+            $this->leaderVersionAgreed = $this->handshake($this->leaderIO);
+        }
+
+        $this->leaderSession = $this->leaderSessionRegistry->getSession($this->leaderVersionAgreed, $this->credentials);
+
+        return $this->leaderSession;
+    }
+
     /**
      * @return int
      *
      * @throws HandshakeException
      */
-    public function handshake()
+    public function handshake($io = null)
     {
+        if (!$io) {
+            $io = $this->io;
+        }
         $packer = new Packer();
 
-        if (!$this->io->isConnected()) {
-            $this->io->reconnect();
+        if (!$io->isConnected()) {
+            $io->reconnect();
         }
 
         $msg = '';
@@ -141,8 +253,8 @@ class Driver implements DriverInterface
         }
 
         try {
-            $this->io->write($msg);
-            $rawHandshakeResponse = $this->io->read(4);
+            $io->write($msg);
+            $rawHandshakeResponse = $io->read(4);
             $response = unpack('N', $rawHandshakeResponse);
             $version = $response[1];
 

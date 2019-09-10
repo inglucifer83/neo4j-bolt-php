@@ -33,7 +33,7 @@ CREATE (carrieanne)-[:ACTS_IN { role : 'Trinity' }]->(matrix2)
 CREATE (carrieanne)-[:ACTS_IN { role : 'Trinity' }]->(matrix3)
 QUERY;
 
-        $this->getSession()->run($q);
+        $this->getWriteSession()->run($q);
     }
 
     public function testGetSimpleNode()

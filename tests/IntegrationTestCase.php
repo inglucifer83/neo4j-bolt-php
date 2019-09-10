@@ -36,10 +36,18 @@ class IntegrationTestCase extends \PHPUnit_Framework_TestCase
     }
 
     /**
+     * @return \Graphaware\Bolt\Protocol\SessionInterface
+     */
+    protected function getWriteSession()
+    {
+        return $this->driver->writeSession();
+    }
+
+    /**
      * Empty the database
      */
     protected function emptyDB()
     {
-        $this->getSession()->run('MATCH (n) DETACH DELETE n');
+        $this->getWriteSession()->run('MATCH (n) DETACH DELETE n');
     }
 }
